@@ -3,14 +3,25 @@
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+#include <sys/ioctl.h>
 #include <termios.h>
 #include <unistd.h>
 
 /*** defines ***/
+
+#define KILO_VERSION "0.0.1"
+
 #define CTRL_KEY(k) ((k) & 0x1f)
 
 /*** data ***/
-struct termios orig_termios;
+struct editorConfig {
+    int screenRows;
+    int screenCols;
+    struct termios orig_termios;
+};
+
+struct editorConfig E;
 
 /*** terminal ***/
 void die(const char* s) {
@@ -22,21 +33,22 @@ void die(const char* s) {
 }
 
 void disableRawMode() {
-    if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_termios) == -1)
+    if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &E.orig_termios) == -1)
         die("tcsetattr");
 }
 
 void enableRawMode() {
-    // disable the ECHO to prevent printing all the keystrokes
-    if (tcgetattr(STDIN_FILENO, &orig_termios) == -1)
+    if (tcgetattr(STDIN_FILENO, &E.orig_termios) == -1)
         die("tcgetattr");
+
     atexit(disableRawMode);
 
-    struct termios raw = orig_termios;
+    struct termios raw = E.orig_termios;
     raw.c_iflag &= ~(BRKINT | ICRNL | INPCK | ISTRIP | IXON);
     raw.c_oflag &=
         ~(OPOST);  // turn off output processing. For new line use \r\n
     raw.c_cflag |= (CS8);
+    // disable the ECHO to prevent printing all the keystrokes
     raw.c_lflag &= ~(ECHO | ICANON | ISIG |
                      IEXTEN);  // ICANON  flag allows to turn off canonical
                                // mode. Read input byte-by-byte
@@ -58,12 +70,128 @@ char editorReadKey() {
     return c;
 }
 
+int getCursorPosition(int* rows, int* cols) {
+    char buf[32];
+    unsigned int i = 0;
+
+    if (write(STDOUT_FILENO, "\x1b[6n", 4) != 4)
+        return -1;
+
+    while (i < sizeof(buf) - 1) {
+        if (read(STDIN_FILENO, &buf[i], 1) != 1)
+            break;
+        if (buf[i] == 'R')
+            break;
+        i++;
+    }
+
+    buf[i] = '\0';
+
+    if (buf[0] != '\x1b' || buf[1] != '[') {
+        return -1;
+    }
+
+    if (sscanf(&buf[2], "%d;%d", rows, cols) != 2)
+        return -1;
+
+    return -0;
+}
+
+int getWindowSize(int* rows, int* cols) {
+    struct winsize ws;
+
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == -1 || ws.ws_col == 0) {
+        if (write(STDOUT_FILENO, "\x1b[999C\x1b[999B", 12) != 12)
+            return -1;
+        return getCursorPosition(rows, cols);
+    } else {
+        *cols = ws.ws_col;
+        *rows = ws.ws_row;
+        return 0;
+    }
+}
+
+/*** append buffer ***/
+
+struct abuf {
+    char* b;
+    int len;
+};
+
+#define ABUF_INIT {NULL, 0}
+
+void abAppend(struct abuf* ab, const char* s, int len) {
+    char* new = realloc(ab->b, ab->len + len);
+
+    if (new == NULL) {
+        perror("abAppend: realloc failed");
+        return;
+    }
+
+    memcpy(&new[ab->len], s, len);
+    ab->b = new;
+    ab->len += len;
+}
+
+void abFree(struct abuf* ab) {
+    free(ab->b);
+}
+
 /*** output ***/
+
+void editorDrawRows(struct abuf* ab) {
+    // Draw a column of tildes (~) on the left side of the screen, like vim does
+    int y;
+    // prints screenrows and cols
+    for (y = 0; y < E.screenRows; y++) {
+        if (y == E.screenRows / 3) {
+            char welcome[60];
+            int welcomeLen =
+                snprintf(welcome, sizeof(welcome), "Kilo Editor -- version %s ",
+                         KILO_VERSION);
+
+            if (welcomeLen > E.screenCols)
+                welcomeLen = E.screenCols;
+
+            int padding = (E.screenCols - welcomeLen) / 2;
+
+            if (padding) {
+                abAppend(ab, "~", 1);
+                padding--;
+            }
+
+            while (padding--)
+                abAppend(ab, " ", 1);
+
+            abAppend(ab, welcome, welcomeLen);
+        } else {
+            abAppend(ab, "~", 1);
+        }
+
+        abAppend(ab, "\x1b[K", 3);
+        if (y < E.screenRows - 1) {
+            abAppend(ab, "\r\n", 2);
+        }
+    }
+}
+
 void editorRefreshScreen() {
-    write(STDOUT_FILENO, "\x1b[2J", 4);
+    struct abuf ab = ABUF_INIT;
+
+    abAppend(&ab, "\x1b[?25l", 6);
     // place the cursor at the top. The default arguments for H both happen to
     // be 1 <esc>[1;1H] Rows & columns are numbered starting at 1, not 0.
-    write(STDOUT_FILENO, "\x1b[H", 3);
+    abAppend(&ab, "\x1b[H", 3);
+
+    editorDrawRows(&ab);
+
+    // after drawing the tildes, reposition the cursor back to the top left
+    // corner
+    abAppend(&ab, "\x1b[H", 3);
+    abAppend(&ab, "\x1b[?25l", 6);
+
+    write(STDOUT_FILENO, ab.b, ab.len);
+    abFree(&ab);
 }
 
 /*** input ***/
@@ -79,8 +207,15 @@ void editorProcessKeypress() {
 }
 
 /*** init ***/
+
+void initEditor() {
+    if (getWindowSize(&E.screenRows, &E.screenCols) == -1)
+        die("getWindowSize");
+}
+
 int main() {
     enableRawMode();
+    initEditor();
 
     while (1) {
         editorRefreshScreen();
